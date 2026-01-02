@@ -1,0 +1,7 @@
+Django>=4.2
+djangorestframework
+djangorestframework-gis
+psycopg2-binary
+django-cors-headers
+django-filter
+django-environ
