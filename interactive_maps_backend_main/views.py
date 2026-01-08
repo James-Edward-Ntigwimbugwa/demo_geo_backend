@@ -39,56 +39,72 @@ async def _sse_batch_stream(sql_template: str, params_template: List, batch_size
     - Uses `sync_to_async` to perform DB work without blocking the ASGI event loop.
     - Each DB batch is fetched with LIMIT %s OFFSET %s to stay index-friendly and avoid
       loading the entire dataset into memory.
-    - Requires an ASGI-capable server (uvicorn/daphne) and Django async support for true
-      non-blocking streaming. If running under WSGI, streaming will still work but will
-      block a worker thread.
+    - Requires an ASGI-capable server (uvicorn/daphne). WSGI does NOT support streaming
+      async generators.
+    - Each event is properly formatted as SSE: "data: <json>\n\n"
+    - Flushes occur per batch so frontend receives events incrementally.
+
+    Why ASGI is required:
+    - WSGI is synchronous and cannot yield from async generators.
+    - ASGI is async-first and handles async iterators natively.
+    - StreamingHttpResponse with async generators only works on ASGI.
 
     The yielded string is SSE 'data' lines terminated by a blank line, e.g.:
         data: {json}\n\n
     """
     offset = 0
     batch_num = 0
-    while True:
-        # Build params for this batch; SQL template must end with "LIMIT %s OFFSET %s"
-        params = list(params_template) + [batch_size, offset]
+    try:
+        while True:
+            # Build params for this batch; SQL template must end with "LIMIT %s OFFSET %s"
+            params = list(params_template) + [batch_size, offset]
 
-        # Run a synchronous fetch on the threadpool so we don't block the event loop
-        rows = await sync_to_async(_fetch_rows)(sql_template, params)
+            # Run a synchronous fetch on the threadpool so we don't block the event loop
+            rows = await sync_to_async(_fetch_rows)(sql_template, params)
 
-        # Parse GeoJSON strings into objects to avoid sending strings to clients
-        for r in rows:
-            for k in ('location', 'geometry'):
-                if r.get(k):
-                    try:
-                        r[k] = json.loads(r[k])
-                    except Exception:
-                        # If parsing fails, leave original text
-                        pass
+            # Parse GeoJSON strings into objects to avoid sending strings to clients
+            for r in rows:
+                for k in ('location', 'geometry'):
+                    if r.get(k):
+                        try:
+                            r[k] = json.loads(r[k])
+                        except Exception:
+                            # If parsing fails, leave original text
+                            pass
 
-        batch_num += 1
-        total_fetched = offset + len(rows)
-        more_pending = len(rows) == batch_size
+            batch_num += 1
+            total_fetched = offset + len(rows)
+            more_pending = len(rows) == batch_size
 
-        payload = {
-            'batch': batch_num,
-            'fetched': total_fetched,
-            'more_pending': more_pending,
-            'items': rows,
-        }
+            payload = {
+                'batch': batch_num,
+                'fetched': total_fetched,
+                'more_pending': more_pending,
+                'items': rows,
+            }
 
-        # SSE requires 'data:' prefix and blank line separator between events
-        yield f"data: {json.dumps(payload)}\n\n"
+            # SSE requires 'data:' prefix and blank line separator between events
+            yield f"data: {json.dumps(payload)}\n\n"
 
-        if not more_pending:
-            break
+            if not more_pending:
+                break
 
-        offset += len(rows)
+            offset += len(rows)
+    except GeneratorExit:
+        # Client disconnected; stop iteration gracefully.
+        # Do NOT log or raise; this is normal behavior.
+        pass
 
 
 def _dictfetchall(cursor):
     """Return all rows from a cursor as a dict"""
     columns = [col[0] for col in cursor.description]
     return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+
+class ClientDisconnected(Exception):
+    """Raised when a client disconnects during streaming or response writing."""
+    pass
 
 
 class RoomsListAPIView(APIView):
@@ -100,6 +116,11 @@ class RoomsListAPIView(APIView):
         using Server-Sent Events (SSE). Each SSE event contains a JSON object with
         metadata and an `items` array. This lets the frontend render partial data
         immediately and append further batches as they arrive.
+
+    Disconnect Handling (Paginated Mode):
+      - Catches BrokenPipeError and ConnectionResetError when writing response
+      - Exits gracefully without logging stack traces (normal behavior when React UI cancels)
+      - Closes database cursors immediately
 
     Performance notes (see _sse_batch_stream):
       - Uses ST_AsGeoJSON to avoid heavy geometry objects in Python
@@ -138,6 +159,10 @@ class RoomsListAPIView(APIView):
                 rows = self._execute_and_fetch(sql, params)
             except OperationalError:
                 return Response({"detail": "Database error"}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+            except (BrokenPipeError, ConnectionResetError):
+                # Client disconnected while we were writing the response.
+                # Exit gracefully without logging (this is normal behavior).
+                return Response(status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
             for r in rows:
                 r['location'] = json.loads(r['location']) if r.get('location') else None
@@ -165,11 +190,19 @@ class RoomsListAPIView(APIView):
             """
             params_template = []
 
-        # StreamingHttpResponse accepts an async iterator on ASGI servers.
-        return StreamingHttpResponse(
+        # StreamingHttpResponse with async iterator requires ASGI.
+        # Proper SSE headers ensure client keeps connection and backend continues streaming.
+        response = StreamingHttpResponse(
             _sse_batch_stream(sql_template, params_template, batch_size=DEFAULT_BATCH_SIZE),
             content_type='text/event-stream'
         )
+        # Prevent client-side and CDN caching of SSE streams
+        response['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+        # Keep connection alive for streaming
+        response['Connection'] = 'keep-alive'
+        # Disable buffering on reverse proxies (nginx, etc.)
+        response['X-Accel-Buffering'] = 'no'
+        return response
 
     def _execute_and_fetch(self, sql: str, params: Optional[List] = None):
         with connection.cursor() as cursor:
@@ -183,6 +216,16 @@ async def base_floor_view(request):
     Two modes:
       - If `limit` is provided: normal paginated JSON response (limit respected).
       - If `limit` is NOT provided: stream batches of `DEFAULT_BATCH_SIZE` via SSE.
+
+    Async Implementation (ASGI Required):
+      - This is an async view that can be used only with ASGI servers (uvicorn, daphne).
+      - WSGI servers cannot handle async views or async generators.
+      - The SSE streaming response uses an async generator and StreamingHttpResponse.
+
+    Disconnect Handling (Paginated Mode):
+      - Catches BrokenPipeError and ConnectionResetError
+      - Exits gracefully without error logs (normal client disconnect)
+      - Closes cursor immediately via context manager
 
     Uses ST_AsGeoJSON in SQL and parses geometry JSON before sending.
     """
@@ -201,15 +244,18 @@ async def base_floor_view(request):
         """
         params = [limit, offset]
 
-        def _execute_and_fetch(sql_inner, params_inner=None):
-            with connection.cursor() as cursor:
-                cursor.execute(sql_inner, params_inner)
-                return _dictfetchall(cursor)
-
         try:
+            def _execute_and_fetch(sql_inner, params_inner=None):
+                with connection.cursor() as cursor:
+                    cursor.execute(sql_inner, params_inner)
+                    return _dictfetchall(cursor)
+
             rows = await sync_to_async(_execute_and_fetch)(sql, params)
         except OperationalError:
             return JsonResponse({"detail": "Database error"}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        except (BrokenPipeError, ConnectionResetError):
+            # Client disconnected. Exit silently; don't log.
+            return JsonResponse(status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
         for r in rows:
             r['geometry'] = json.loads(r['geometry']) if r.get('geometry') else None
@@ -225,10 +271,18 @@ async def base_floor_view(request):
     """
     params_template: List = []
 
-    return StreamingHttpResponse(
+    # StreamingHttpResponse with async generator requires ASGI.
+    response = StreamingHttpResponse(
         _sse_batch_stream(sql_template, params_template, batch_size=DEFAULT_BATCH_SIZE),
         content_type='text/event-stream'
     )
+    # Prevent caching of SSE streams
+    response['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    # Keep connection alive for streaming
+    response['Connection'] = 'keep-alive'
+    # Disable buffering on reverse proxies
+    response['X-Accel-Buffering'] = 'no'
+    return response
 
 
 class RouteAPIView(APIView):
