@@ -14,6 +14,76 @@ from .serializers import RoomSerializer, RouteRequestSerializer, RouteResultSeri
 
 logger = logging.getLogger(__name__)
 
+# Default batch size per requirements
+DEFAULT_BATCH_SIZE = 500
+
+
+def _fetch_rows(sql: str, params: Optional[List] = None):
+    """Helper to run a SQL query and return dict rows.
+
+    Kept synchronous so it can be wrapped with `sync_to_async` when used in async contexts.
+    Uses server-side SQL with LIMIT/OFFSET to avoid loading large resultsets into memory.
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(sql, params)
+        return _dictfetchall(cursor)
+
+
+async def _sse_batch_stream(sql_template: str, params_template: List, batch_size: int = DEFAULT_BATCH_SIZE):
+    """Async generator that yields Server-Sent Events (SSE) formatted chunks.
+
+    Each chunk contains a small JSON object with metadata and an `items` array.
+    Clients can use EventSource (SSE) to receive and append batches as they arrive.
+
+    Implementation notes:
+    - Uses `sync_to_async` to perform DB work without blocking the ASGI event loop.
+    - Each DB batch is fetched with LIMIT %s OFFSET %s to stay index-friendly and avoid
+      loading the entire dataset into memory.
+    - Requires an ASGI-capable server (uvicorn/daphne) and Django async support for true
+      non-blocking streaming. If running under WSGI, streaming will still work but will
+      block a worker thread.
+
+    The yielded string is SSE 'data' lines terminated by a blank line, e.g.:
+        data: {json}\n\n
+    """
+    offset = 0
+    batch_num = 0
+    while True:
+        # Build params for this batch; SQL template must end with "LIMIT %s OFFSET %s"
+        params = list(params_template) + [batch_size, offset]
+
+        # Run a synchronous fetch on the threadpool so we don't block the event loop
+        rows = await sync_to_async(_fetch_rows)(sql_template, params)
+
+        # Parse GeoJSON strings into objects to avoid sending strings to clients
+        for r in rows:
+            for k in ('location', 'geometry'):
+                if r.get(k):
+                    try:
+                        r[k] = json.loads(r[k])
+                    except Exception:
+                        # If parsing fails, leave original text
+                        pass
+
+        batch_num += 1
+        total_fetched = offset + len(rows)
+        more_pending = len(rows) == batch_size
+
+        payload = {
+            'batch': batch_num,
+            'fetched': total_fetched,
+            'more_pending': more_pending,
+            'items': rows,
+        }
+
+        # SSE requires 'data:' prefix and blank line separator between events
+        yield f"data: {json.dumps(payload)}\n\n"
+
+        if not more_pending:
+            break
+
+        offset += len(rows)
+
 
 def _dictfetchall(cursor):
     """Return all rows from a cursor as a dict"""
@@ -24,45 +94,82 @@ def _dictfetchall(cursor):
 class RoomsListAPIView(APIView):
     """GET /api/rooms/?q=&limit=&offset=
 
-    Lightweight list of rooms (id, name, location GeoJSON)
-    Uses raw SQL to avoid loading heavy geometry objects into Python.
+    Supports two modes:
+      - If `limit` is provided by client: return a normal (paginated) JSON response.
+      - If `limit` is NOT provided: stream results in batches of `DEFAULT_BATCH_SIZE`
+        using Server-Sent Events (SSE). Each SSE event contains a JSON object with
+        metadata and an `items` array. This lets the frontend render partial data
+        immediately and append further batches as they arrive.
+
+    Performance notes (see _sse_batch_stream):
+      - Uses ST_AsGeoJSON to avoid heavy geometry objects in Python
+      - Uses LIMIT/OFFSET to fetch index-friendly batches
+      - Does not load entire dataset into memory
     """
 
     def get(self, request):
         q = request.query_params.get('q', '').strip()
-        limit = min(int(request.query_params.get('limit', 100)), 1000)
-        offset = int(request.query_params.get('offset', 0))
+        limit_param = request.query_params.get('limit')
 
-        # Build SQL; use parameterized query
+        # If client supplied an explicit limit -> behave like a normal paginated response
+        if limit_param is not None:
+            limit = min(int(limit_param), 1000)
+            offset = int(request.query_params.get('offset', 0))
+
+            if q:
+                sql = """
+                SELECT ogc_fid, text, ST_AsGeoJSON(wkb_geometry) AS location
+                FROM room_points
+                WHERE text ILIKE %s
+                ORDER BY text
+                LIMIT %s OFFSET %s
+                """
+                params = [f"%{q}%", limit, offset]
+            else:
+                sql = """
+                SELECT ogc_fid, text, ST_AsGeoJSON(wkb_geometry) AS location
+                FROM room_points
+                ORDER BY text
+                LIMIT %s OFFSET %s
+                """
+                params = [limit, offset]
+
+            try:
+                rows = self._execute_and_fetch(sql, params)
+            except OperationalError:
+                return Response({"detail": "Database error"}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+            for r in rows:
+                r['location'] = json.loads(r['location']) if r.get('location') else None
+
+            serializer = RoomSerializer(rows, many=True)
+            return Response(serializer.data)
+
+        # No explicit limit -> start SSE batched streaming with default batch size
+        # Build template SQL with LIMIT/OFFSET placeholders at the end for _sse_batch_stream
         if q:
-            sql = """
+            sql_template = """
             SELECT ogc_fid, text, ST_AsGeoJSON(wkb_geometry) AS location
             FROM room_points
             WHERE text ILIKE %s
             ORDER BY text
             LIMIT %s OFFSET %s
             """
-            params = [f"%{q}%", limit, offset]
+            params_template = [f"%{q}%"]
         else:
-            sql = """
+            sql_template = """
             SELECT ogc_fid, text, ST_AsGeoJSON(wkb_geometry) AS location
             FROM room_points
             ORDER BY text
             LIMIT %s OFFSET %s
             """
-            params = [limit, offset]
+            params_template = []
 
-        try:
-            rows = self._execute_and_fetch(sql, params)
-        except OperationalError as e:
-            return Response({"detail": "Database error"}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
-
-        # Convert location JSON string to object
-        for r in rows:
-            r['location'] = json.loads(r['location']) if r.get('location') else None
-
-        serializer = RoomSerializer(rows, many=True)
-        return Response(serializer.data)
+        # StreamingHttpResponse accepts an async iterator on ASGI servers.
+        return StreamingHttpResponse(
+            _sse_batch_stream(sql_template, params_template, batch_size=DEFAULT_BATCH_SIZE),
+            content_type='text/event-stream'
+        )
 
     def _execute_and_fetch(self, sql: str, params: Optional[List] = None):
         with connection.cursor() as cursor:
@@ -71,37 +178,57 @@ class RoomsListAPIView(APIView):
 
 
 async def base_floor_view(request):
-    """Async GET /api/base-floor/ - returns `base_floor` rows with GeoJSON geometry.
+    """GET /api/base-floor/
 
-    Implemented as an async function-based view that Django will await.
-    Returns a `JsonResponse` (safe=False) with an array of objects.
+    Two modes:
+      - If `limit` is provided: normal paginated JSON response (limit respected).
+      - If `limit` is NOT provided: stream batches of `DEFAULT_BATCH_SIZE` via SSE.
+
+    Uses ST_AsGeoJSON in SQL and parses geometry JSON before sending.
     """
 
-    limit = min(int(request.GET.get('limit', 100)), 1000)
-    offset = int(request.GET.get('offset', 0))
+    limit_param = request.GET.get('limit')
 
-    sql = """
+    if limit_param is not None:
+        limit = min(int(limit_param), 1000)
+        offset = int(request.GET.get('offset', 0))
+
+        sql = """
+        SELECT ogc_fid, layer, paperspace, text, ST_AsGeoJSON(wkb_geometry) AS geometry
+        FROM base_floor
+        ORDER BY ogc_fid
+        LIMIT %s OFFSET %s
+        """
+        params = [limit, offset]
+
+        def _execute_and_fetch(sql_inner, params_inner=None):
+            with connection.cursor() as cursor:
+                cursor.execute(sql_inner, params_inner)
+                return _dictfetchall(cursor)
+
+        try:
+            rows = await sync_to_async(_execute_and_fetch)(sql, params)
+        except OperationalError:
+            return JsonResponse({"detail": "Database error"}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        for r in rows:
+            r['geometry'] = json.loads(r['geometry']) if r.get('geometry') else None
+
+        return JsonResponse(rows, safe=False)
+
+    # No explicit limit: stream via SSE in batches
+    sql_template = """
     SELECT ogc_fid, layer, paperspace, text, ST_AsGeoJSON(wkb_geometry) AS geometry
     FROM base_floor
     ORDER BY ogc_fid
     LIMIT %s OFFSET %s
     """
-    params = [limit, offset]
+    params_template: List = []
 
-    def _execute_and_fetch(sql_inner, params_inner=None):
-        with connection.cursor() as cursor:
-            cursor.execute(sql_inner, params_inner)
-            return _dictfetchall(cursor)
-
-    try:
-        rows = await sync_to_async(_execute_and_fetch)(sql, params)
-    except OperationalError:
-        return JsonResponse({"detail": "Database error"}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
-
-    for r in rows:
-        r['geometry'] = json.loads(r['geometry']) if r.get('geometry') else None
-
-    return JsonResponse(rows, safe=False)
+    return StreamingHttpResponse(
+        _sse_batch_stream(sql_template, params_template, batch_size=DEFAULT_BATCH_SIZE),
+        content_type='text/event-stream'
+    )
 
 
 class RouteAPIView(APIView):
