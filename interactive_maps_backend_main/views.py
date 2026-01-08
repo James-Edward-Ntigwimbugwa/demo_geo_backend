@@ -2,6 +2,7 @@ import json
 import logging
 from typing import List, Optional
 
+from asgiref.sync import sync_to_async
 from django.conf import settings
 from django.db import connection, OperationalError
 from django.http import JsonResponse, HttpResponse, StreamingHttpResponse
@@ -67,6 +68,42 @@ class RoomsListAPIView(APIView):
         with connection.cursor() as cursor:
             cursor.execute(sql, params)
             return _dictfetchall(cursor)
+
+
+class BaseFloorAsyncAPIView(APIView):
+    """Async GET /api/base-floor/ - returns `base_floor` rows with GeoJSON geometry.
+
+    Implemented as an async view using sync_to_async wrapper to avoid blocking the event loop.
+    """
+
+    async def get(self, request):
+        limit = min(int(request.query_params.get('limit', 100)), 1000)
+        offset = int(request.query_params.get('offset', 0))
+
+        sql = """
+        SELECT ogc_fid, layer, paperspace, text, ST_AsGeoJSON(wkb_geometry) AS geometry
+        FROM base_floor
+        ORDER BY ogc_fid
+        LIMIT %s OFFSET %s
+        """
+        params = [limit, offset]
+
+        def _execute_and_fetch(sql_inner, params_inner=None):
+            with connection.cursor() as cursor:
+                cursor.execute(sql_inner, params_inner)
+                return _dictfetchall(cursor)
+
+        try:
+            rows = await sync_to_async(_execute_and_fetch)(sql, params)
+        except OperationalError:
+            return Response({"detail": "Database error"}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        for r in rows:
+            r['geometry'] = json.loads(r['geometry']) if r.get('geometry') else None
+
+        from .serializers import BaseFloorSerializer
+        serializer = BaseFloorSerializer(rows, many=True)
+        return Response(serializer.data)
 
 
 class RouteAPIView(APIView):

@@ -16,3 +16,11 @@ class RouteRequestSerializer(serializers.Serializer):
 class RouteResultSerializer(serializers.Serializer):
     distance_meters = serializers.FloatField()
     route = serializers.JSONField()  # GeoJSON LineString
+
+
+class BaseFloorSerializer(serializers.Serializer):
+    id = serializers.IntegerField(source='ogc_fid')
+    layer = serializers.CharField(allow_null=True)
+    paperspace = serializers.BooleanField(allow_null=True)
+    text = serializers.CharField(allow_null=True)
+    geometry = serializers.JSONField()  # GeoJSON LineString

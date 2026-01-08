@@ -34,3 +34,19 @@ class NavEdgesWorkVerticesPgr(models.Model):
     class Meta:
         db_table = 'nav_edges_work_vertices_pgr'
         managed = False
+
+
+class BaseFloor(models.Model):
+    """Represents `base_floor` table (building floor polylines)."""
+    ogc_fid = models.IntegerField(primary_key=True)
+    wkb_geometry = geomodels.LineStringField(srid=4326, dim=3, null=True)
+    layer = models.CharField(max_length=255, null=True)
+    paperspace = models.BooleanField(null=True)
+    subclasses = models.CharField(max_length=255, null=True)
+    linetype = models.CharField(max_length=255, null=True)
+    entityhandle = models.CharField(max_length=255, null=True)
+    text = models.CharField(max_length=255, null=True)
+
+    class Meta:
+        db_table = 'base_floor'
+        managed = False
