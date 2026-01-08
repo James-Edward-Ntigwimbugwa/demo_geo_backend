@@ -1,8 +1,7 @@
 Django>=4.2
-djangorestframework
-djangorestframework-gis
-psycopg2-binary
-django-cors-headers
-django-filter
-django-environ
-drf-spectacular
+djangorestframework>=3.14
+psycopg2-binary>=2.9
+psycopg>=3.1  # optional; one of psycopg2 or psycopg
+gunicorn>=20
+uvicorn>=0.22
+psycopg_pool>=3.1  # optional pool library

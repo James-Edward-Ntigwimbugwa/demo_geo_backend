@@ -10,6 +10,7 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
+import os
 from pathlib import Path
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
@@ -20,12 +21,12 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-847btqrgm*t8t52w1vzw+y5zc1o1w_6+d!q-kcky-8p6a!5&2j'
+SECRET_KEY = 'django-insecure-ylsa4uzcw$$^f(bt3oip91&fpqbwxz0a3x-k3+s^h2$7@&t^7!'
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = ['*']
+ALLOWED_HOSTS = []
 
 
 # Application definition
@@ -37,14 +38,17 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+
+    # GeoDjango & REST
+    'django.contrib.gis',
     'rest_framework',
-    'drf_spectacular',
+
+    # Local app
     'interactive_maps_backend_main',
 ]
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
-    'django.middleware.gzip.GZipMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -76,17 +80,43 @@ WSGI_APPLICATION = 'interactive_maps_backend_config.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/6.0/ref/settings/#databases
 
+# PostGIS-ready database configuration. Use environment variables in production and
+# prefer a connection pooler (pgbouncer) for scaling. DO NOT create tables via Django
+# migrations for the existing GIS dataset (these tables are managed externally).
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.postgresql',
-        'NAME': 'interactive_maps_demo',    
-        'USER': 'postgres',        
-        'PASSWORD': 'ntigwimbugwa2001', 
-        'HOST': 'localhost',     
-        'PORT': '5432',          
+        'ENGINE': 'django.contrib.gis.db.backends.postgis',
+        'NAME': os.environ.get('POSTGRES_DB', 'interactive_maps_demo'),
+        'USER': os.environ.get('POSTGRES_USER', 'postgres'),
+        'PASSWORD': os.environ.get('POSTGRES_PASSWORD', 'ntigwimbugwa2001'),
+        'HOST': os.environ.get('POSTGRES_HOST', 'localhost'),
+        'PORT': os.environ.get('POSTGRES_PORT', '5432'),
+        # Keep connections persistent for some time; use an external pooler for better scaling
+        'CONN_MAX_AGE': int(os.environ.get('CONN_MAX_AGE', 600)),
+        'OPTIONS': {
+            # short connect timeout and a statement timeout safeguard (ms)
+            'connect_timeout': int(os.environ.get('PG_CONNECT_TIMEOUT', 5)),
+            'options': os.environ.get('PG_OPTIONS', '-c statement_timeout=5000'),
+        },
     }
 }
 
+# REST framework minimal config
+# Disable SessionAuthentication to avoid touching the `django_session` table for public API endpoints.
+# Use explicit authentication classes in production as needed (Token/JWT) and enforce permissions per-view.
+REST_FRAMEWORK = {
+    'DEFAULT_RENDERER_CLASSES': (
+        'rest_framework.renderers.JSONRenderer',
+    ),
+    'DEFAULT_PARSER_CLASSES': (
+        'rest_framework.parsers.JSONParser',
+    ),
+    # No default session auth to avoid DB session table dependency for unauthenticated endpoints
+    'DEFAULT_AUTHENTICATION_CLASSES': (),
+    'DEFAULT_PERMISSION_CLASSES': (
+        'rest_framework.permissions.AllowAny',
+    ),
+}
 
 
 # Password validation
@@ -124,19 +154,3 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/6.0/howto/static-files/
 
 STATIC_URL = 'static/'
-
-# REST Framework Configuration
-REST_FRAMEWORK = {
-    'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
-    'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
-    'PAGE_SIZE': 100,
-}
-
-# drf-spectacular Configuration
-SPECTACULAR_SETTINGS = {
-    'TITLE': 'Interactive Maps API',
-    'DESCRIPTION': 'API for navigation and routing in interactive maps with pgRouting support',
-    'VERSION': '1.0.0',
-    'SERVE_PERMISSIONS': ['rest_framework.permissions.AllowAny'],
-    'SCHEMA_PATH_PREFIX': '/api/',
-}

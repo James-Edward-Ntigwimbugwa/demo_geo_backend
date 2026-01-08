@@ -1,624 +1,317 @@
 import json
-from django.http import JsonResponse
-from django.db import connection
+import logging
+from typing import List, Optional
+
+from django.conf import settings
+from django.db import connection, OperationalError
+from django.http import JsonResponse, HttpResponse, StreamingHttpResponse
+from rest_framework import status
+from rest_framework.views import APIView
+from rest_framework.response import Response
+
+from .serializers import RoomSerializer, RouteRequestSerializer, RouteResultSerializer
+
+logger = logging.getLogger(__name__)
 
 
-def _rows_to_featurecollection(rows, geom_key, props_keys):
-	"""Convert database rows to GeoJSON FeatureCollection."""
-	features = []
-	for row in rows:
-		geom_json = row.get(geom_key)
-		try:
-			geometry = json.loads(geom_json) if geom_json else None
-		except Exception:
-			geometry = None
-
-		properties = {k: row.get(k) for k in props_keys if k in row}
-
-		feature = {
-			"type": "Feature",
-			"geometry": geometry,
-			"properties": properties,
-		}
-		features.append(feature)
-
-	return {"type": "FeatureCollection", "features": features}
+def _dictfetchall(cursor):
+    """Return all rows from a cursor as a dict"""
+    columns = [col[0] for col in cursor.description]
+    return [dict(zip(columns, row)) for row in cursor.fetchall()]
 
 
-def _execute_geojson_query(sql, params=None):
-	"""Execute a SQL query and return results as list of dicts."""
-	with connection.cursor() as cursor:
-		cursor.execute(sql, params or [])
-		desc = [col[0] for col in cursor.description]
-		rows = [dict(zip(desc, r)) for r in cursor.fetchall()]
-	return rows
+class RoomsListAPIView(APIView):
+    """GET /api/rooms/?q=&limit=&offset=
+
+    Lightweight list of rooms (id, name, location GeoJSON)
+    Uses raw SQL to avoid loading heavy geometry objects into Python.
+    """
+
+    def get(self, request):
+        q = request.query_params.get('q', '').strip()
+        limit = min(int(request.query_params.get('limit', 100)), 1000)
+        offset = int(request.query_params.get('offset', 0))
+
+        # Build SQL; use parameterized query
+        if q:
+            sql = """
+            SELECT ogc_fid, text, ST_AsGeoJSON(wkb_geometry) AS location
+            FROM room_points
+            WHERE text ILIKE %s
+            ORDER BY text
+            LIMIT %s OFFSET %s
+            """
+            params = [f"%{q}%", limit, offset]
+        else:
+            sql = """
+            SELECT ogc_fid, text, ST_AsGeoJSON(wkb_geometry) AS location
+            FROM room_points
+            ORDER BY text
+            LIMIT %s OFFSET %s
+            """
+            params = [limit, offset]
+
+        try:
+            rows = self._execute_and_fetch(sql, params)
+        except OperationalError as e:
+            return Response({"detail": "Database error"}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        # Convert location JSON string to object
+        for r in rows:
+            r['location'] = json.loads(r['location']) if r.get('location') else None
+
+        serializer = RoomSerializer(rows, many=True)
+        return Response(serializer.data)
+
+    def _execute_and_fetch(self, sql: str, params: Optional[List] = None):
+        with connection.cursor() as cursor:
+            cursor.execute(sql, params)
+            return _dictfetchall(cursor)
 
 
-def base_floor_geojson(request):
-	"""Get base floor geometries as GeoJSON."""
-	sql = """
-	SELECT ogc_fid, layer, paperspace, subclasses, linetype, entityhandle, text, ST_AsGeoJSON(wkb_geometry) AS geom
-	FROM base_floor
-	"""
-	rows = _execute_geojson_query(sql)
-	props = ['ogc_fid', 'layer', 'paperspace', 'subclasses', 'linetype', 'entityhandle', 'text']
-	fc = _rows_to_featurecollection(rows, 'geom', props)
-	return JsonResponse(fc, safe=False)
+class RouteAPIView(APIView):
+    """POST /api/route/
+
+    Body: { start_room_id, end_room_id, simplify_tolerance (optional) }
+
+    Runs all heavy lifting in SQL using pgr_dijkstra on `nav_edges_final`. Returns
+    GeoJSON LineString and total distance in meters.
+    """
+
+    def post(self, request):
+        """Compute route by delegating to DB function `get_route_between_rooms`.
+
+        The database function is expected to return a JSONB with keys:
+          - start_vertex, end_vertex
+          - total_cost_meters
+          - route_geojson (GeoJSON object) or NULL
+          - or {"error": "..."}
+
+        Note: this function (provided by the DB) projects room geometries to metric CRS (3857) and runs routing on `nav_edges_work`.
+        """
+        serializer = RouteRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        start_room_id = serializer.validated_data['start_room_id']
+        end_room_id = serializer.validated_data['end_room_id']
+        simplify_tolerance = serializer.validated_data.get('simplify_tolerance', 0.0)
+
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT public.get_route_between_rooms(%s, %s)", [start_room_id, end_room_id])
+                row = cursor.fetchone()
+
+            if not row or not row[0]:
+                return Response({"detail": "Route function returned no data"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+            res = row[0]
+            # psycopg may return JSON as str or already parsed python object
+            if isinstance(res, str):
+                res = json.loads(res)
+
+            if isinstance(res, dict) and 'error' in res:
+                return Response({"detail": res['error']}, status=status.HTTP_422_UNPROCESSABLE_ENTITY)
+
+            # Extract fields
+            total_cost = res.get('total_cost_meters')
+            route_geojson = res.get('route_geojson')
+
+            if route_geojson is None:
+                return Response({"detail": "No path found between the selected rooms."}, status=status.HTTP_404_NOT_FOUND)
+
+            result = {"distance_meters": float(total_cost or 0.0), "route": route_geojson}
+            result_serializer = RouteResultSerializer(result)
+            return Response(result_serializer.data)
+
+        except OperationalError:
+            logger.exception("OperationalError during route computation")
+            return Response({"detail": "Database error"}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        except Exception as e:
+            logger.exception("Route computation failed")
+            err_str = str(e)
+            # Helpful hint when function is missing
+            if 'get_route_between_rooms' in err_str or 'function get_route_between_rooms' in err_str.lower():
+                hint = (
+                    "Database function `get_route_between_rooms` is missing or failed. "
+                    "Run the provided SQL to create it and ensure it runs successfully in psql."
+                )
+                details = f"{hint} Details: {err_str}"
+                return Response({"detail": details}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+            if getattr(settings, 'DEBUG', False):
+                return Response({"detail": err_str}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response({"detail": "Internal server error"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    def _find_nearest_vertex(self, room_id: int) -> int:
+        # Robust nearest-vertex lookup that handles missing SRID on room geometries.
+        # If the room's geometry has SRID=0 (unknown), we assume it's already in the same
+        # coordinate system as the vertex table and set the SRID to the target vertex SRID
+        # instead of calling ST_Transform which fails for SRID=0.
+        sql = """
+            SELECT v.id
+            FROM nav_edges_work_vertices_pgr v
+            JOIN room_points r ON r.ogc_fid = %s
+            ORDER BY v.the_geom <-> (
+                CASE
+                    WHEN ST_SRID(r.wkb_geometry) = 0 THEN ST_SetSRID(r.wkb_geometry, ST_SRID(v.the_geom))
+                    WHEN ST_SRID(r.wkb_geometry) = ST_SRID(v.the_geom) THEN r.wkb_geometry
+                    ELSE ST_Transform(r.wkb_geometry, ST_SRID(v.the_geom))
+                END
+            )
+            LIMIT 1
+        """
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(sql, [room_id])
+                row = cursor.fetchone()
+        except OperationalError as e:
+            # Surface a more helpful message when ST_Transform fails due to unknown SRID
+            if 'Input geometry has unknown (0) SRID' in str(e):
+                raise ValueError(f"Room with id={room_id} has geometry with unknown SRID. "
+                                 "Please set an appropriate SRID on room_points.wkb_geometry or ensure it is stored in the same CRS as nav vertices.")
+            raise
+
+        if not row:
+            raise ValueError(f"Room with id={room_id} not found or no nearby vertex")
+        return int(row[0])
+
+    def _detect_nav_edges_final_schema(self):
+        """Detect and cache column names for nav_edges_final table.
+
+        Returns a dict: {id_col, source_col, target_col, cost_col, geom_col}
+        Raises RuntimeError with helpful message if required columns are missing.
+        """
+        if hasattr(self, '_nav_edges_schema'):
+            return self._nav_edges_schema
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = %s",
+                ['nav_edges_final'],
+            )
+            cols = {row[0] for row in cursor.fetchall()}
+
+        # Candidate names
+        id_candidates = ['ogc_fid', 'gid', 'id', 'edge_id']
+        source_candidates = ['source', 'start_vid', 'u', 'from_id', 'from']
+        target_candidates = ['target', 'end_vid', 'v', 'to_id', 'to']
+        cost_candidates = ['cost', 'length', 'distance', 'weight']
+        geom_candidates = ['wkb_geometry', 'geom', 'the_geom', 'geometry']
+
+        def pick(cands):
+            for c in cands:
+                if c in cols:
+                    return c
+            return None
+
+        id_col = pick(id_candidates)
+        source_col = pick(source_candidates)
+        target_col = pick(target_candidates)
+        cost_col = pick(cost_candidates)
+        geom_col = pick(geom_candidates)
+
+        missing = []
+        if id_col is None:
+            missing.append('id column (e.g. ogc_fid, id, gid)')
+        if source_col is None or target_col is None:
+            missing.append('source/target columns (e.g. source, target)')
+        if cost_col is None:
+            missing.append('cost column (e.g. cost, length)')
+        if geom_col is None:
+            missing.append('geometry column (e.g. wkb_geometry, geom)')
+
+        if missing:
+            raise RuntimeError(
+                'nav_edges_final is missing required columns: ' + ', '.join(missing) +
+                ". Columns found: " + ','.join(sorted(cols))
+            )
+
+        schema = {
+            'id_col': id_col,
+            'source_col': source_col,
+            'target_col': target_col,
+            'cost_col': cost_col,
+            'geom_col': geom_col,
+        }
+        self._nav_edges_schema = schema
+        logger.debug('Detected nav_edges_final schema: %s', schema)
+        return schema
+
+    def _compute_route_edges(self, start_vid: int, end_vid: int) -> List[int]:
+        # Run pgr_dijkstra in DB and return ordered list of edge ids
+        schema = self._detect_nav_edges_final_schema()
+        inner_sql = f"SELECT {schema['id_col']} AS id, {schema['source_col']} AS source, {schema['target_col']} AS target, {schema['cost_col']} AS cost FROM nav_edges_final"
+
+        sql = f"""
+            WITH route AS (
+                SELECT * FROM pgr_dijkstra(
+                    '{inner_sql}',
+                    %s, %s, directed := false
+                )
+            )
+            SELECT array_remove(array_agg(edge ORDER BY seq), -1) AS edges
+            FROM route
+        """
+        with connection.cursor() as cursor:
+            cursor.execute(sql, [start_vid, end_vid])
+            row = cursor.fetchone()
+            if not row or not row[0]:
+                return []
+            return [int(e) for e in row[0]]
+
+    def _assemble_route_geometry(self, edge_id_list: List[int], simplify_tolerance: float):
+        schema = self._detect_nav_edges_final_schema()
+        geom_col = schema['geom_col']
+        id_col = schema['id_col']
+        # Use ST_LineMerge(ST_Collect(geom)) to get a single LineString; apply ST_Simplify if requested
+        # The simplify_tolerance must be in the same units as nav_edges_final geometry (prefer metric)
+        sql = f"""
+            SELECT
+                ST_AsGeoJSON(
+                    CASE WHEN %s > 0 THEN ST_Simplify(ST_LineMerge(ST_Collect({geom_col})), %s) ELSE ST_LineMerge(ST_Collect({geom_col})) END
+                ) AS geojson,
+                SUM({schema['cost_col']}) AS distance_meters
+            FROM nav_edges_final
+            WHERE {id_col} = ANY(%s::int[])
+        """
+        with connection.cursor() as cursor:
+            cursor.execute(sql, [simplify_tolerance, simplify_tolerance, edge_id_list])
+            row = cursor.fetchone()
+            if not row:
+                raise RuntimeError('Failed to assemble route geometry')
+            return row[0], row[1]
+
+class HealthAPIView(APIView):
+    def get(self, request):
+        try:
+            ok = self._check_db()
+        except OperationalError:
+            return Response({"ok": False, "db": False}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        return Response({"ok": ok})
+
+    def _check_db(self):
+        with connection.cursor() as cursor:
+            cursor.execute('SELECT 1')
+            return bool(cursor.fetchone())
 
 
-def corridors_geojson(request):
-	"""Get corridors as GeoJSON."""
-	sql = """
-	SELECT ogc_fid, fid, label, type, ST_AsGeoJSON(wkb_geometry) AS geom
-	FROM corridors
-	"""
-	rows = _execute_geojson_query(sql)
-	fc = _rows_to_featurecollection(rows, 'geom', ['ogc_fid', 'fid', 'label', 'type'])
-	return JsonResponse(fc, safe=False)
+class RouteCacheAPIView(APIView):
+    """Optional endpoint to fetch cached route geometry from `route_result` table by id."""
 
+    def get(self, request, cache_id: int):
+        sql = "SELECT ST_AsGeoJSON(the_geom) as geojson, distance_meters FROM route_result WHERE id = %s"
+        try:
+            rows = self._execute_and_fetch(sql, [cache_id])
+        except OperationalError:
+            return Response({"detail": "Database error"}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
-def room_points_geojson(request):
-	"""Get room points as GeoJSON."""
-	sql = """
-	SELECT ogc_fid, layer, paperspace, subclasses, linetype, entityhandle, text, ST_AsGeoJSON(wkb_geometry) AS geom
-	FROM room_points
-	"""
-	rows = _execute_geojson_query(sql)
-	props = ['ogc_fid', 'layer', 'paperspace', 'subclasses', 'linetype', 'entityhandle', 'text']
-	fc = _rows_to_featurecollection(rows, 'geom', props)
-	return JsonResponse(fc, safe=False)
+        if not rows:
+            return Response({"detail": "Cache not found"}, status=status.HTTP_404_NOT_FOUND)
 
+        item = rows[0]
+        return Response({"distance_meters": float(item.get('distance_meters') or 0.0), "route": json.loads(item.get('geojson') or '{"type":"LineString","coordinates":[]}')})
 
-def nav_nodes_geojson(request):
-	"""Get navigation nodes (original) as GeoJSON."""
-	sql = """
-	SELECT ogc_fid, fid, label, node_type, ST_AsGeoJSON(wkb_geometry) AS geom
-	FROM nav_nodes
-	"""
-	rows = _execute_geojson_query(sql)
-	fc = _rows_to_featurecollection(rows, 'geom', ['ogc_fid', 'fid', 'label', 'node_type'])
-	return JsonResponse(fc, safe=False)
-
-
-def nav_nodes_proj_geojson(request):
-	"""Get projected navigation nodes as GeoJSON (EPSG:3857)."""
-	sql = """
-	SELECT id, label, node_type, ST_AsGeoJSON(geom) AS geom
-	FROM nav_nodes_proj
-	"""
-	rows = _execute_geojson_query(sql)
-	fc = _rows_to_featurecollection(rows, 'geom', ['id', 'label', 'node_type'])
-	return JsonResponse(fc, safe=False)
-
-
-def nav_nodes_snapped_geojson(request):
-	"""Get snapped navigation nodes as GeoJSON."""
-	sql = """
-	SELECT id, label, node_type, ST_AsGeoJSON(geom) AS geom
-	FROM nav_nodes_snapped
-	"""
-	rows = _execute_geojson_query(sql)
-	fc = _rows_to_featurecollection(rows, 'geom', ['id', 'label', 'node_type'])
-	return JsonResponse(fc, safe=False)
-
-
-def nav_edges_geojson(request):
-	"""Get navigation edges (original) as GeoJSON."""
-	sql = """
-	SELECT ogc_fid, fid, label, from_id, to_id, ST_AsGeoJSON(wkb_geometry) AS geom
-	FROM nav_edges
-	"""
-	rows = _execute_geojson_query(sql)
-	fc = _rows_to_featurecollection(rows, 'geom', ['ogc_fid', 'fid', 'label', 'from_id', 'to_id'])
-	return JsonResponse(fc, safe=False)
-
-
-def nav_edges_proj_geojson(request):
-	"""Get projected navigation edges as GeoJSON (EPSG:3857)."""
-	sql = """
-	SELECT id, label, cost, ST_AsGeoJSON(geom) AS geom
-	FROM nav_edges_proj
-	"""
-	rows = _execute_geojson_query(sql)
-	fc = _rows_to_featurecollection(rows, 'geom', ['id', 'label', 'cost'])
-	return JsonResponse(fc, safe=False)
-
-
-def nav_edges_final_geojson(request):
-	"""Get final navigation edges as GeoJSON."""
-	sql = """
-	SELECT id, label, cost, ST_AsGeoJSON(geom) AS geom
-	FROM nav_edges_final
-	"""
-	rows = _execute_geojson_query(sql)
-	fc = _rows_to_featurecollection(rows, 'geom', ['id', 'label', 'cost'])
-	return JsonResponse(fc, safe=False)
-
-
-def route_shortest_path(request):
-	"""
-	Find shortest path between two nodes using pgr_dijkstra.
-	
-	GET Parameters:
-		- start: source node id from nav_nodes_snapped or nav_nodes_proj
-		- end: target node id from nav_nodes_snapped or nav_nodes_proj
-	
-	Returns GeoJSON FeatureCollection with the shortest path route.
-	"""
-	start_id = request.GET.get('start')
-	end_id = request.GET.get('end')
-	
-	if not start_id or not end_id:
-		return JsonResponse({
-			'error': 'Missing required parameters: start and end node IDs'
-		}, status=400)
-	
-	try:
-		start_id = int(start_id)
-		end_id = int(end_id)
-	except (ValueError, TypeError):
-		return JsonResponse({
-			'error': 'start and end parameters must be valid integers'
-		}, status=400)
-	
-	with connection.cursor() as cursor:
-		# Verify that the nodes exist
-		cursor.execute("SELECT id FROM nav_nodes_proj WHERE id = %s", [start_id])
-		if not cursor.fetchone():
-			return JsonResponse({
-				'error': f'Start node {start_id} not found'
-			}, status=404)
-		
-		cursor.execute("SELECT id FROM nav_nodes_proj WHERE id = %s", [end_id])
-		if not cursor.fetchone():
-			return JsonResponse({
-				'error': f'End node {end_id} not found'
-			}, status=404)
-		
-		# Run pgr_dijkstra using nav_edges_work (topology prepared)
-		try:
-			dijkstra_sql = """
-			SELECT seq, path_seq, node, edge, cost
-			FROM pgr_dijkstra(
-				'SELECT id, source, target, cost FROM nav_edges_work',
-				%s, %s, false
-			) AS t(seq, path_seq, node, edge, cost)
-			"""
-			cursor.execute(dijkstra_sql, [start_id, end_id])
-			path_results = cursor.fetchall()
-			
-			if not path_results:
-				return JsonResponse({
-					'error': f'No path found between nodes {start_id} and {end_id}'
-				}, status=404)
-			
-			# Extract edge IDs from path results
-			edge_ids = [row[3] for row in path_results if row[3] and row[3] != -1]
-			
-			if not edge_ids:
-				return JsonResponse({
-					'error': 'Path found but no edges in route'
-				}, status=404)
-			
-			# Get the geometry and cost information for edges in order
-			edges_sql = """
-			SELECT id, label, cost, ST_AsGeoJSON(geom) AS geom
-			FROM nav_edges_final
-			WHERE id = ANY(%s)
-			ORDER BY id
-			"""
-			cursor.execute(edges_sql, [edge_ids])
-			edge_desc = [col[0] for col in cursor.description]
-			edge_rows = [dict(zip(edge_desc, row)) for row in cursor.fetchall()]
-			
-		except Exception as e:
-			return JsonResponse({
-				'error': f'pgRouting error: {str(e)}'
-			}, status=500)
-	
-	# Build ordered feature collection following the path sequence
-	id_to_edge = {row['id']: row for row in edge_rows}
-	features = []
-	total_cost = 0
-	
-	for path_row in path_results:
-		seq, path_seq, node, edge, cost = path_row
-		if edge == -1 or edge not in id_to_edge:
-			continue
-		
-		edge_data = id_to_edge[edge]
-		try:
-			geometry = json.loads(edge_data['geom']) if edge_data.get('geom') else None
-		except Exception:
-			geometry = None
-		
-		total_cost += cost if cost else 0
-		
-		feature = {
-			'type': 'Feature',
-			'geometry': geometry,
-			'properties': {
-				'id': edge_data['id'],
-				'label': edge_data.get('label'),
-				'edge_cost': edge_data.get('cost'),
-				'path_sequence': seq,
-				'cumulative_cost': total_cost,
-			}
-		}
-		features.append(feature)
-	
-	fc = {
-		'type': 'FeatureCollection',
-		'features': features,
-		'properties': {
-			'start_node': start_id,
-			'end_node': end_id,
-			'total_cost': total_cost,
-			'path_length': len(features),
-		}
-	}
-	
-	return JsonResponse(fc, safe=False)
-
-
-def route_astar_path(request):
-	"""
-	Find shortest path between two nodes using pgr_astar algorithm.
-	Requires heuristic and more efficient than Dijkstra for large graphs.
-	
-	GET Parameters:
-		- start: source node id from nav_nodes_snapped or nav_nodes_proj
-		- end: target node id from nav_nodes_snapped or nav_nodes_proj
-		- factor: cost factor (default: 1.0)
-	
-	Returns GeoJSON FeatureCollection with the shortest path route.
-	"""
-	start_id = request.GET.get('start')
-	end_id = request.GET.get('end')
-	factor = request.GET.get('factor', 1.0)
-	
-	if not start_id or not end_id:
-		return JsonResponse({
-			'error': 'Missing required parameters: start and end node IDs'
-		}, status=400)
-	
-	try:
-		start_id = int(start_id)
-		end_id = int(end_id)
-		factor = float(factor)
-	except (ValueError, TypeError):
-		return JsonResponse({
-			'error': 'Invalid parameter types'
-		}, status=400)
-	
-	with connection.cursor() as cursor:
-		# Verify nodes exist
-		cursor.execute("SELECT id FROM nav_nodes_proj WHERE id = %s", [start_id])
-		if not cursor.fetchone():
-			return JsonResponse({
-				'error': f'Start node {start_id} not found'
-			}, status=404)
-		
-		cursor.execute("SELECT id FROM nav_nodes_proj WHERE id = %s", [end_id])
-		if not cursor.fetchone():
-			return JsonResponse({
-				'error': f'End node {end_id} not found'
-			}, status=404)
-		
-		try:
-			# pgr_astar with geometry heuristic
-			astar_sql = """
-			SELECT seq, path_seq, node, edge, cost
-			FROM pgr_astar(
-				'SELECT id, source, target, cost, x1, y1, x2, y2 
-				 FROM (SELECT nf.id, nf.source, nf.target, nf.cost,
-				       ST_X(ST_StartPoint(nf.geom)) as x1, ST_Y(ST_StartPoint(nf.geom)) as y1,
-				       ST_X(ST_EndPoint(nf.geom)) as x2, ST_Y(ST_EndPoint(nf.geom)) as y2
-				 FROM nav_edges_work nf) sub',
-				%s, %s, factor => %s, directed => false
-			) AS t(seq, path_seq, node, edge, cost)
-			"""
-			cursor.execute(astar_sql, [start_id, end_id, factor])
-			path_results = cursor.fetchall()
-			
-			if not path_results:
-				return JsonResponse({
-					'error': f'No path found between nodes {start_id} and {end_id}'
-				}, status=404)
-			
-			edge_ids = [row[3] for row in path_results if row[3] and row[3] != -1]
-			
-			if not edge_ids:
-				return JsonResponse({
-					'error': 'Path found but no edges in route'
-				}, status=404)
-			
-			edges_sql = """
-			SELECT id, label, cost, ST_AsGeoJSON(geom) AS geom
-			FROM nav_edges_final
-			WHERE id = ANY(%s)
-			"""
-			cursor.execute(edges_sql, [edge_ids])
-			edge_desc = [col[0] for col in cursor.description]
-			edge_rows = [dict(zip(edge_desc, row)) for row in cursor.fetchall()]
-			
-		except Exception as e:
-			return JsonResponse({
-				'error': f'pgRouting A* error: {str(e)}'
-			}, status=500)
-	
-	id_to_edge = {row['id']: row for row in edge_rows}
-	features = []
-	total_cost = 0
-	
-	for path_row in path_results:
-		seq, path_seq, node, edge, cost = path_row
-		if edge == -1 or edge not in id_to_edge:
-			continue
-		
-		edge_data = id_to_edge[edge]
-		try:
-			geometry = json.loads(edge_data['geom']) if edge_data.get('geom') else None
-		except Exception:
-			geometry = None
-		
-		total_cost += cost if cost else 0
-		
-		feature = {
-			'type': 'Feature',
-			'geometry': geometry,
-			'properties': {
-				'id': edge_data['id'],
-				'label': edge_data.get('label'),
-				'edge_cost': edge_data.get('cost'),
-				'path_sequence': seq,
-				'cumulative_cost': total_cost,
-			}
-		}
-		features.append(feature)
-	
-	fc = {
-		'type': 'FeatureCollection',
-		'features': features,
-		'properties': {
-			'start_node': start_id,
-			'end_node': end_id,
-			'total_cost': total_cost,
-			'path_length': len(features),
-			'algorithm': 'A*',
-		}
-	}
-	
-	return JsonResponse(fc, safe=False)
-
-
-def route_via_points(request):
-	"""
-	Find route passing through multiple waypoints using pgr_dijkstra in sequence.
-	
-	GET Parameters:
-		- nodes: comma-separated list of node IDs in order
-	
-	Returns GeoJSON FeatureCollection with the complete route through all waypoints.
-	"""
-	nodes_param = request.GET.get('nodes')
-	
-	if not nodes_param:
-		return JsonResponse({
-			'error': 'Missing required parameter: nodes (comma-separated list)'
-		}, status=400)
-	
-	try:
-		nodes = [int(n.strip()) for n in nodes_param.split(',')]
-		if len(nodes) < 2:
-			return JsonResponse({
-				'error': 'At least 2 nodes are required'
-			}, status=400)
-	except (ValueError, TypeError):
-		return JsonResponse({
-			'error': 'Invalid node IDs'
-		}, status=400)
-	
-	with connection.cursor() as cursor:
-		# Verify all nodes exist
-		for nid in nodes:
-			cursor.execute("SELECT id FROM nav_nodes_proj WHERE id = %s", [nid])
-			if not cursor.fetchone():
-				return JsonResponse({
-					'error': f'Node {nid} not found'
-				}, status=404)
-		
-		# Calculate routes between consecutive nodes
-		all_features = []
-		total_cost = 0
-		feature_sequence = 0
-		
-		for i in range(len(nodes) - 1):
-			start_node = nodes[i]
-			end_node = nodes[i + 1]
-			
-			try:
-				dijkstra_sql = """
-				SELECT seq, path_seq, node, edge, cost
-				FROM pgr_dijkstra(
-					'SELECT id, source, target, cost FROM nav_edges_work',
-					%s, %s, false
-				) AS t(seq, path_seq, node, edge, cost)
-				"""
-				cursor.execute(dijkstra_sql, [start_node, end_node])
-				path_results = cursor.fetchall()
-				
-				if not path_results:
-					continue
-				
-				edge_ids = [row[3] for row in path_results if row[3] and row[3] != -1]
-				
-				if edge_ids:
-					edges_sql = """
-					SELECT id, label, cost, ST_AsGeoJSON(geom) AS geom
-					FROM nav_edges_final
-					WHERE id = ANY(%s)
-					"""
-					cursor.execute(edges_sql, [edge_ids])
-					edge_desc = [col[0] for col in cursor.description]
-					edge_rows = [dict(zip(edge_desc, row)) for row in cursor.fetchall()]
-					
-					id_to_edge = {row['id']: row for row in edge_rows}
-					
-					for path_row in path_results:
-						seq, path_seq, node, edge, cost = path_row
-						if edge == -1 or edge not in id_to_edge:
-							continue
-						
-						edge_data = id_to_edge[edge]
-						try:
-							geometry = json.loads(edge_data['geom']) if edge_data.get('geom') else None
-						except Exception:
-							geometry = None
-						
-						total_cost += cost if cost else 0
-						feature_sequence += 1
-						
-						feature = {
-							'type': 'Feature',
-							'geometry': geometry,
-							'properties': {
-								'id': edge_data['id'],
-								'label': edge_data.get('label'),
-								'edge_cost': edge_data.get('cost'),
-								'segment': i + 1,
-								'sequence': feature_sequence,
-								'cumulative_cost': total_cost,
-							}
-						}
-						all_features.append(feature)
-			
-			except Exception as e:
-				return JsonResponse({
-					'error': f'pgRouting error in segment {i + 1}: {str(e)}'
-				}, status=500)
-	
-	if not all_features:
-		return JsonResponse({
-			'error': 'No route found through the specified waypoints'
-		}, status=404)
-	
-	fc = {
-		'type': 'FeatureCollection',
-		'features': all_features,
-		'properties': {
-			'waypoints': nodes,
-			'segments': len(nodes) - 1,
-			'total_cost': total_cost,
-			'total_edges': len(all_features),
-		}
-	}
-	
-	return JsonResponse(fc, safe=False)
-
-
-def route_isochrone(request):
-	"""
-	Get all nodes and edges reachable within a cost distance from a start node.
-	
-	GET Parameters:
-		- start: source node id
-		- distance: maximum cost distance (default: 100)
-	
-	Returns GeoJSON FeatureCollection with reachable edges.
-	"""
-	start_id = request.GET.get('start')
-	distance = request.GET.get('distance', 100)
-	
-	if not start_id:
-		return JsonResponse({
-			'error': 'Missing required parameter: start node ID'
-		}, status=400)
-	
-	try:
-		start_id = int(start_id)
-		distance = float(distance)
-	except (ValueError, TypeError):
-		return JsonResponse({
-			'error': 'Invalid parameter types'
-		}, status=400)
-	
-	with connection.cursor() as cursor:
-		cursor.execute("SELECT id FROM nav_nodes_proj WHERE id = %s", [start_id])
-		if not cursor.fetchone():
-			return JsonResponse({
-				'error': f'Start node {start_id} not found'
-			}, status=404)
-		
-		try:
-			# Use pgr_dijkstraCost to find all reachable nodes
-			cost_sql = """
-			SELECT node, cost
-			FROM pgr_dijkstraCost(
-				'SELECT id, source, target, cost FROM nav_edges_work',
-				%s, (SELECT array_agg(id) FROM nav_nodes_proj), false
-			) AS t(start_vid, node, cost)
-			WHERE cost <= %s
-			"""
-			cursor.execute(cost_sql, [start_id, distance])
-			cost_results = cursor.fetchall()
-			
-			if not cost_results:
-				return JsonResponse({
-					'type': 'FeatureCollection',
-					'features': [],
-					'properties': {
-						'start_node': start_id,
-						'distance': distance,
-						'reachable_nodes': 0,
-					}
-				}, safe=False)
-			
-			reachable_nodes = [row[0] for row in cost_results]
-			
-			# Get all edges that connect these nodes
-			edges_sql = """
-			SELECT DISTINCT nf.id, nf.label, nf.cost, ST_AsGeoJSON(nf.geom) AS geom
-			FROM nav_edges_final nf
-			JOIN nav_edges_work nw ON nf.id = nw.id
-			WHERE nw.source = ANY(%s) OR nw.target = ANY(%s)
-			"""
-			cursor.execute(edges_sql, [reachable_nodes, reachable_nodes])
-			edge_desc = [col[0] for col in cursor.description]
-			edge_rows = [dict(zip(edge_desc, row)) for row in cursor.fetchall()]
-			
-		except Exception as e:
-			return JsonResponse({
-				'error': f'pgRouting error: {str(e)}'
-			}, status=500)
-	
-	features = []
-	for edge in edge_rows:
-		try:
-			geometry = json.loads(edge['geom']) if edge.get('geom') else None
-		except Exception:
-			geometry = None
-		
-		feature = {
-			'type': 'Feature',
-			'geometry': geometry,
-			'properties': {
-				'id': edge['id'],
-				'label': edge.get('label'),
-				'cost': edge.get('cost'),
-			}
-		}
-		features.append(feature)
-	
-	fc = {
-		'type': 'FeatureCollection',
-		'features': features,
-		'properties': {
-			'start_node': start_id,
-			'distance': distance,
-			'reachable_nodes': len(reachable_nodes),
-			'reachable_edges': len(features),
-		}
-	}
-	
-	return JsonResponse(fc, safe=False)
+    def _execute_and_fetch(self, sql: str, params: Optional[List] = None):
+        with connection.cursor() as cursor:
+            cursor.execute(sql, params)
+            return _dictfetchall(cursor)
