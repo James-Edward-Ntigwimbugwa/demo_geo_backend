@@ -70,40 +70,38 @@ class RoomsListAPIView(APIView):
             return _dictfetchall(cursor)
 
 
-class BaseFloorAsyncAPIView(APIView):
+async def base_floor_view(request):
     """Async GET /api/base-floor/ - returns `base_floor` rows with GeoJSON geometry.
 
-    Implemented as an async view using sync_to_async wrapper to avoid blocking the event loop.
+    Implemented as an async function-based view that Django will await.
+    Returns a `JsonResponse` (safe=False) with an array of objects.
     """
 
-    async def get(self, request):
-        limit = min(int(request.query_params.get('limit', 100)), 1000)
-        offset = int(request.query_params.get('offset', 0))
+    limit = min(int(request.GET.get('limit', 100)), 1000)
+    offset = int(request.GET.get('offset', 0))
 
-        sql = """
-        SELECT ogc_fid, layer, paperspace, text, ST_AsGeoJSON(wkb_geometry) AS geometry
-        FROM base_floor
-        ORDER BY ogc_fid
-        LIMIT %s OFFSET %s
-        """
-        params = [limit, offset]
+    sql = """
+    SELECT ogc_fid, layer, paperspace, text, ST_AsGeoJSON(wkb_geometry) AS geometry
+    FROM base_floor
+    ORDER BY ogc_fid
+    LIMIT %s OFFSET %s
+    """
+    params = [limit, offset]
 
-        def _execute_and_fetch(sql_inner, params_inner=None):
-            with connection.cursor() as cursor:
-                cursor.execute(sql_inner, params_inner)
-                return _dictfetchall(cursor)
+    def _execute_and_fetch(sql_inner, params_inner=None):
+        with connection.cursor() as cursor:
+            cursor.execute(sql_inner, params_inner)
+            return _dictfetchall(cursor)
 
-        try:
-            rows = await sync_to_async(_execute_and_fetch)(sql, params)
-        except OperationalError:
-            return Response({"detail": "Database error"}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+    try:
+        rows = await sync_to_async(_execute_and_fetch)(sql, params)
+    except OperationalError:
+        return JsonResponse({"detail": "Database error"}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
-        for r in rows:
-            r['geometry'] = json.loads(r['geometry']) if r.get('geometry') else None
+    for r in rows:
+        r['geometry'] = json.loads(r['geometry']) if r.get('geometry') else None
 
-        from .serializers import BaseFloorSerializer
-        serializer = BaseFloorSerializer(rows, many=True)
-        return Response(serializer.data)
+    return JsonResponse(rows, safe=False)
 
 
 class RouteAPIView(APIView):

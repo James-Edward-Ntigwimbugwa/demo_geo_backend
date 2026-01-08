@@ -11,6 +11,13 @@
   - Response: `{distance_meters, route: GeoJSON LineString}`
 
 - GET `/api/health/` — simple health check
+- GET `/api/base-floor/` — list `base_floor` polylines (async)
+  - Query parameters: `limit` (default 100, max 1000), `offset` (default 0)
+  - Response: `[{id, layer, paperspace, text, geometry: GeoJSON LineString}]`
+  - Example curl (returns up to 5 rows):
+
+      curl -sS 'http://localhost:8000/api/base-floor/?limit=5' | jq '.'
+
 - GET `/api/schema/` — API schema (OpenAPI-like)
 - GET `/api/route/cache/{id}` — fetch cached route from `route_result` (optional table)
 
